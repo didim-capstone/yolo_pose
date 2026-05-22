@@ -1,65 +1,85 @@
 # yolo_pose
 
-ROS 2 Humble shared YOLO pose inference package.
+ROS 2 Humble package for shared YOLO pose inference.
 
-This package subscribes to `/camera/image_raw`, loads the YOLO pose engine once,
-runs pose inference once per image, and publishes one shared result to
-`/vision/yolo_pose`.
+`yolo_pose` subscribes to `/camera/image_raw`, runs YOLO pose inference once per image, and publishes the selected person result to `/vision/yolo_pose`.
 
-It is separated so `person_follower` and `fall_detection` do not each run their
-own YOLO model.
-
-## Role In The Current Structure
+This package lets `person_follower` and `fall_detection` share one YOLO result instead of running separate YOLO models.
 
 ```text
 camera_publisher_node
-  └── publishes /camera/image_raw
+  └── /camera/image_raw
         ↓
 yolo_pose_node
-  └── publishes /vision/yolo_pose
-        ├── person_follower_node subscribes
-        └── fall_detection_node subscribes
+  └── /vision/yolo_pose
+        ├── person_follower_node
+        └── fall_detection_node
 ```
 
-`scene_description_node` does not use `/vision/yolo_pose`; it subscribes to the
-camera image directly for VLM input.
+## Features
+
+- Subscribes to shared camera images
+- Loads one YOLO pose TensorRT engine
+- Runs person pose inference
+- Publishes bbox, bbox center, track ID, keypoints, and confidence values
+- Publishes an annotated image for debugging
 
 ## Node
 
-| Node | Executable | Role |
+| Node | Executable | Description |
 | --- | --- | --- |
-| `yolo_pose_node` | `yolo_pose_node` | Runs YOLO pose once on each camera frame and publishes the selected person result. |
+| `yolo_pose_node` | `yolo_pose_node` | Runs YOLO pose inference on `/camera/image_raw` and publishes `/vision/yolo_pose`. |
 
-## Subscribed Topic
+## Topics
+
+### Subscribed
 
 | Topic | Type | Description |
 | --- | --- | --- |
 | `/camera/image_raw` | `sensor_msgs/msg/Image` | Raw image from `camera_publisher_node`. |
 
-## Published Topics
+### Published
 
 | Topic | Type | Description |
 | --- | --- | --- |
-| `/vision/yolo_pose` | `senior_msg/msg/YoloPose` | Shared selected-person pose result. |
-| `/camera/annotated` | `sensor_msgs/msg/Image` | Optional debug image with YOLO annotation. |
+| `/vision/yolo_pose` | `senior_msg/msg/YoloPose` | Shared selected-person YOLO pose result. |
+| `/camera/annotated` | `sensor_msgs/msg/Image` | Debug image with YOLO annotation. |
 
 ## Output Message
 
-`/vision/yolo_pose` contains:
+`/vision/yolo_pose` publishes `senior_msg/msg/YoloPose`.
+
+| Field | Description |
+| --- | --- |
+| `detected` | Whether a person was detected. |
+| `confidence` | YOLO confidence score. |
+| `class_id` | YOLO class ID. For person, this is usually `0`. |
+| `track_id` | Tracking ID when tracking is available. |
+| `x1, y1, x2, y2` | Bounding box coordinates. |
+| `cx, cy` | Bounding box center point. |
+| `image_width, image_height` | Source image size. |
+| `keypoints[34]` | COCO 17 keypoints as x, y pairs. |
+| `keypoint_confidences[17]` | Confidence score for each keypoint. |
+
+If no person is detected:
 
 ```text
-detected
-confidence
-class_id
-track_id
-x1, y1, x2, y2
-cx, cy
-image_width, image_height
-keypoints[34]
-keypoint_confidences[17]
+detected=False
+bbox values=0
+keypoints=0
+keypoint_confidences=0
+track_id=-1
 ```
 
-If no person is detected, `detected=False` and bbox/keypoint values are zero.
+## Parameters
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `yolo_model` | `/home/jetson/yolov8n-pose.engine` | TensorRT YOLO pose engine path. |
+| `yolo_conf` | `0.45` | Confidence threshold. |
+| `use_yolo_tracking` | `True` | Use YOLO tracking when available. |
+| `tracker_config` | `bytetrack.yaml` | Tracker config file or name. |
+| `show_display` | `False` | Show OpenCV debug window. |
 
 ## Build
 
@@ -70,9 +90,9 @@ colcon build --packages-select senior_msg yolo_pose
 source install/setup.bash
 ```
 
-## Run This Package
+## Run
 
-Start the camera stream first:
+Start the camera publisher first:
 
 ```bash
 ros2 run camera_publisher camera_publisher_node
@@ -84,28 +104,21 @@ Then start YOLO pose:
 ros2 run yolo_pose yolo_pose_node
 ```
 
-After `/vision/yolo_pose` is being published, consumers can be started:
+## Run With Parameters
 
 ```bash
-ros2 run person_follower person_follower_node
-ros2 run fall_detection fall_detection_node
+ros2 run yolo_pose yolo_pose_node --ros-args \
+  -p yolo_model:=/home/jetson/yolov8n-pose.engine \
+  -p yolo_conf:=0.45 \
+  -p use_yolo_tracking:=True \
+  -p tracker_config:=bytetrack.yaml
 ```
 
-## Parameters
+## Related Packages
 
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `yolo_model` | `/home/jetson/yolov8n-pose.engine` | TensorRT YOLO pose engine path. |
-| `yolo_conf` | `0.45` | YOLO confidence threshold. |
-| `use_yolo_tracking` | `True` | Use YOLO tracking when available. |
-| `tracker_config` | `bytetrack.yaml` | Tracker config name/path. |
-| `show_display` | `False` | Show OpenCV debug window. |
-
-## Check
-
-```bash
-ros2 topic list
-ros2 topic echo /vision/yolo_pose
-ros2 topic hz /vision/yolo_pose
-ros2 topic hz /camera/image_raw
-```
+| Package | Relation |
+| --- | --- |
+| `camera_publisher` | Publishes `/camera/image_raw`. |
+| `person_follower` | Subscribes `/vision/yolo_pose` and uses bbox for YOLO-LiDAR following. |
+| `fall_detection` | Subscribes `/vision/yolo_pose` and uses keypoints for fall detection. |
+| `senior_msg` | Provides `YoloPose.msg`. |
