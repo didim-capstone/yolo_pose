@@ -37,12 +37,43 @@ class YoloPoseNode(Node):
         self.declare_parameter('use_yolo_tracking', True)
         self.declare_parameter('tracker_config', 'bytetrack.yaml')
         self.declare_parameter('show_display', False)
+        self.declare_parameter('camera_hfov', 70.0)
+        self.declare_parameter('yolo_min_box_height_ratio', 0.08)
+        self.declare_parameter('yolo_min_box_area_ratio', 0.003)
+        self.declare_parameter('yolo_min_box_aspect_ratio', 0.0)
+        self.declare_parameter('yolo_max_box_aspect_ratio', 999.0)
+        self.declare_parameter('yolo_max_box_width_ratio', 0.80)
+        self.declare_parameter('target_switch_penalty_deg', 12.0)
+        self.declare_parameter('target_reacquire_frames', 30)
+        self.declare_parameter('yolo_tracking_max_failures', 5)
 
         self.model_path = self.get_parameter('yolo_model').value
         self.conf_thres = float(self.get_parameter('yolo_conf').value)
         self.use_tracking = bool(self.get_parameter('use_yolo_tracking').value)
         self.tracker_config = self.get_parameter('tracker_config').value
         self.show_display = bool(self.get_parameter('show_display').value)
+        self.hfov = float(self.get_parameter('camera_hfov').value)
+        self.yolo_min_box_height_ratio = float(
+            self.get_parameter('yolo_min_box_height_ratio').value)
+        self.yolo_min_box_area_ratio = float(
+            self.get_parameter('yolo_min_box_area_ratio').value)
+        self.yolo_min_box_aspect_ratio = float(
+            self.get_parameter('yolo_min_box_aspect_ratio').value)
+        self.yolo_max_box_aspect_ratio = float(
+            self.get_parameter('yolo_max_box_aspect_ratio').value)
+        self.yolo_max_box_width_ratio = float(
+            self.get_parameter('yolo_max_box_width_ratio').value)
+        self.switch_penalty = float(
+            self.get_parameter('target_switch_penalty_deg').value)
+        self.target_reacquire_frames = int(
+            self.get_parameter('target_reacquire_frames').value)
+        self.yolo_tracking_max_failures = int(
+            self.get_parameter('yolo_tracking_max_failures').value)
+
+        self.target_track_id = None
+        self.target_missing_count = 0
+        self.last_target_angle = None
+        self.yolo_tracking_failure_count = 0
 
         self.bridge = CvBridge()
         self.model = YOLO(self.model_path, task='pose')
@@ -90,14 +121,29 @@ class YoloPoseNode(Node):
 
     def _run_yolo(self, frame):
         if self.use_tracking:
-            return self.model.track(
-                frame,
-                classes=[0],
-                conf=self.conf_thres,
-                persist=True,
-                tracker=self.tracker_config,
-                verbose=False,
-            )
+            try:
+                results = self.model.track(
+                    frame,
+                    classes=[0],
+                    conf=self.conf_thres,
+                    persist=True,
+                    tracker=self.tracker_config,
+                    verbose=False,
+                )
+                self.yolo_tracking_failure_count = 0
+                return results
+            except Exception as exc:
+                self.yolo_tracking_failure_count += 1
+                if self.yolo_tracking_failure_count >= self.yolo_tracking_max_failures:
+                    self.get_logger().warn(
+                        f'YOLO tracking {self.yolo_tracking_failure_count}회 연속 실패; '
+                        f'tracking 비활성화. 마지막 오류: {exc}')
+                    self.use_tracking = False
+                else:
+                    self.get_logger().warn(
+                        f'YOLO tracking 실패 ({self.yolo_tracking_failure_count}/'
+                        f'{self.yolo_tracking_max_failures}); predict fallback: {exc}',
+                        throttle_duration_sec=3.0)
         return self.model.predict(
             frame,
             classes=[0],
@@ -119,6 +165,11 @@ class YoloPoseNode(Node):
             return msg
 
         boxes_xyxy = result.boxes.xyxy.cpu().numpy()
+        target_idx = self._select_target_index(result, boxes_xyxy, image_width, image_height)
+        if target_idx is None:
+            msg.detected = False
+            return msg
+
         confs = (
             result.boxes.conf.cpu().numpy()
             if result.boxes.conf is not None else np.zeros((len(boxes_xyxy),), dtype=np.float32)
@@ -128,10 +179,7 @@ class YoloPoseNode(Node):
             if result.boxes.cls is not None else np.zeros((len(boxes_xyxy),), dtype=np.int32)
         )
 
-        areas = np.maximum(boxes_xyxy[:, 2] - boxes_xyxy[:, 0], 0.0) * np.maximum(
-            boxes_xyxy[:, 3] - boxes_xyxy[:, 1], 0.0)
-        scores = confs + (areas / max(float(image_width * image_height), 1.0))
-        idx = int(np.argmax(scores))
+        idx = int(target_idx)
 
         x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[idx]]
         msg.detected = True
@@ -162,6 +210,101 @@ class YoloPoseNode(Node):
                 msg.keypoint_confidences = [1.0] * 17
 
         return msg
+
+    def _select_target_index(self, result, boxes_raw, img_w, img_h):
+        mask = self._get_person_like_box_mask(boxes_raw, img_w, img_h)
+        valid_indices = np.where(mask)[0]
+
+        rejected = int(len(boxes_raw) - np.count_nonzero(mask))
+        if rejected:
+            self.get_logger().info(
+                f'reject non-person-like boxes: {rejected}/{len(boxes_raw)}',
+                throttle_duration_sec=1.0)
+
+        if len(valid_indices) == 0:
+            self._handle_no_person_boxes()
+            return None
+
+        boxes = boxes_raw[valid_indices]
+        centers = (boxes[:, 0] + boxes[:, 2]) / 2.0
+        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        angles = ((centers - img_w / 2.0) / (img_w / 2.0)) * (self.hfov / 2.0)
+
+        track_ids = None
+        if self.use_tracking and getattr(result.boxes, 'id', None) is not None:
+            all_track_ids = result.boxes.id.cpu().numpy().astype(np.int32)
+            track_ids = all_track_ids[valid_indices]
+
+        if track_ids is not None:
+            if self.target_track_id is None:
+                local_idx = int(np.argmax(areas))
+                self.target_track_id = int(track_ids[local_idx])
+                self.target_missing_count = 0
+                self.last_target_angle = float(angles[local_idx])
+                self.get_logger().info(f'target locked: track_id={self.target_track_id}')
+                return int(valid_indices[local_idx])
+
+            matches = np.where(track_ids == self.target_track_id)[0]
+            if len(matches) > 0:
+                local_idx = int(matches[0])
+                self.target_missing_count = 0
+                self.last_target_angle = float(angles[local_idx])
+                return int(valid_indices[local_idx])
+
+            self.target_missing_count += 1
+            if self.target_missing_count <= self.target_reacquire_frames:
+                self.get_logger().info(
+                    f'reacquiring track_id={self.target_track_id} '
+                    f'({self.target_missing_count}/{self.target_reacquire_frames})',
+                    throttle_duration_sec=0.5)
+                return None
+
+            self.get_logger().warn(
+                f'track_id={self.target_track_id} lost after '
+                f'{self.target_reacquire_frames} frames; relocking')
+            self._reset_target_tracking()
+
+            local_idx = int(np.argmax(areas))
+            self.target_track_id = int(track_ids[local_idx])
+            self.target_missing_count = 0
+            self.last_target_angle = float(angles[local_idx])
+            self.get_logger().info(f'target relocked: track_id={self.target_track_id}')
+            return int(valid_indices[local_idx])
+
+        if self.last_target_angle is None:
+            local_idx = int(np.argmax(areas))
+        else:
+            area_score = areas / max(float(np.max(areas)), 1.0)
+            angle_cost = np.abs(angles - self.last_target_angle) / self.switch_penalty
+            local_idx = int(np.argmax(area_score - angle_cost))
+
+        self.last_target_angle = float(angles[local_idx])
+        return int(valid_indices[local_idx])
+
+    def _get_person_like_box_mask(self, boxes, img_w, img_h):
+        widths = np.maximum(boxes[:, 2] - boxes[:, 0], 1.0)
+        heights = np.maximum(boxes[:, 3] - boxes[:, 1], 1.0)
+        area_ratios = (widths * heights) / max(float(img_w * img_h), 1.0)
+        height_ratios = heights / max(float(img_h), 1.0)
+        width_ratios = widths / max(float(img_w), 1.0)
+        aspect_ratios = heights / widths
+        return (
+            (height_ratios >= self.yolo_min_box_height_ratio)
+            & (area_ratios >= self.yolo_min_box_area_ratio)
+            & (aspect_ratios >= self.yolo_min_box_aspect_ratio)
+            & (aspect_ratios <= self.yolo_max_box_aspect_ratio)
+            & (width_ratios <= self.yolo_max_box_width_ratio)
+        )
+
+    def _handle_no_person_boxes(self):
+        self.target_missing_count += 1
+        if self.target_missing_count > self.target_reacquire_frames:
+            self._reset_target_tracking()
+            self.last_target_angle = None
+
+    def _reset_target_tracking(self):
+        self.target_track_id = None
+        self.target_missing_count = 0
 
     def _publish_empty(self, header, image_width, image_height):
         msg = YoloPose()

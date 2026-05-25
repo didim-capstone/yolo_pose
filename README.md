@@ -80,6 +80,12 @@ track_id=-1
 | `use_yolo_tracking` | `True` | Use YOLO tracking when available. |
 | `tracker_config` | `bytetrack.yaml` | Tracker config file or name. |
 | `show_display` | `False` | Show OpenCV debug window. |
+| `camera_hfov` | `70.0` | Used for target continuity scoring. |
+| `target_switch_penalty_deg` | `12.0` | Penalty for switching far from the previous target angle. |
+| `target_reacquire_frames` | `30` | Frames to wait before relocking to a new tracked person. |
+| `yolo_min_box_height_ratio` | `0.08` | Person-like bbox filter, aligned with `person_follower`. |
+| `yolo_min_box_area_ratio` | `0.003` | Person-like bbox filter, aligned with `person_follower`. |
+| `yolo_max_box_width_ratio` | `0.80` | Person-like bbox filter, aligned with `person_follower`. |
 
 ## Build
 
@@ -122,3 +128,12 @@ ros2 run yolo_pose yolo_pose_node --ros-args \
 | `person_follower` | Subscribes `/vision/yolo_pose` and uses bbox for YOLO-LiDAR following. |
 | `fall_detection` | Subscribes `/vision/yolo_pose` and uses keypoints for fall detection. |
 | `senior_msg` | Provides `YoloPose.msg`. |
+
+## Check
+
+```bash
+ros2 topic list
+ros2 topic echo /vision/yolo_pose
+ros2 topic hz /vision/yolo_pose
+ros2 topic hz /camera/image_raw
+```
